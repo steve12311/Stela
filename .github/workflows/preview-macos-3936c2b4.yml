@@ -1,0 +1,159 @@
+# Preview build of upstream Stela at 3936c2b4, isolated from main.
+# Mirrors the upstream release app -> efi -> macOS CLI artifact chain,
+# without creating or publishing a release or changing the default branch.
+name: Preview macOS installer (3936c2b4)
+
+on:
+  push:
+    branches:
+      - build/stela-main-3936c2b4
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stela-preview-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  app:
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build Stela.app
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="$(bash guest/stela-app/build.sh | tee /dev/stderr | tail -1)"
+          test -f "$app/Contents/Info.plist"
+          tar -C "$(dirname "$app")" -cf Stela.app.tar Stela.app
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-preview-app
+          path: Stela.app.tar
+          if-no-files-found: error
+          retention-days: 14
+
+  efi:
+    needs: app
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Clang and LLVM 21
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends clang-21 lld-21 llvm-21 libclang-21-dev
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustc --version
+      - name: Build cache keys
+        id: keys
+        shell: bash
+        run: |
+          pins="$(git ls-tree HEAD third_party | sha256sum | cut -c1-16)"
+          tools="$(printf '%s\n%s\n' "$(clang --version | head -1)" "$(rustc --version)" | sha256sum | cut -c1-16)"
+          echo "nvk=$pins-$tools" >> "$GITHUB_OUTPUT"
+          echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-preview-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'crates/stela-boot/Cargo.lock') }}
+      - uses: actions/cache@v4
+        with:
+          path: .tools/gpu
+          key: gpu-tools-preview-${{ steps.keys.outputs.image }}-${{ hashFiles('xtask/src/gpu/toolchain.rs') }}
+      - uses: actions/cache@v4
+        id: nvk
+        with:
+          path: target/gpu
+          key: nvk-preview-${{ steps.keys.outputs.nvk }}-${{ hashFiles('xtask/src/gpu/**', 'crates/stela-driver-gpu/**', 'third_party/patches/**', 'third_party/*.sparse') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: stela-preview-app
+          path: app
+      - name: Unpack app bundle
+        shell: bash
+        run: |
+          tar -C app -xf app/Stela.app.tar
+          echo "STELA_APP=$PWD/app/Stela.app" >> "$GITHUB_ENV"
+      - name: Fetch Mesa, LLVM and other upstream sources
+        run: cargo xtask gpu fetch
+      - name: Keep valid cached GPU objects current
+        if: steps.nvk.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          find third_party crates/stela-driver-gpu -path '*/.git' -prune -o -type f -print0 | xargs -0 touch -h -d '2000-01-01T00:00:00Z'
+      - name: Compile complete Stela EFI
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo xtask boot build --release
+          efi=target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
+          test "$(head -c 2 "$efi")" = MZ
+          mkdir -p dist
+          cp "$efi" dist/stela.efi
+          sha256sum dist/stela.efi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-preview-efi
+          path: dist/stela.efi
+          if-no-files-found: error
+          retention-days: 14
+
+  macos:
+    needs: efi
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust targets
+        shell: bash
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          clang --version | head -1
+      - uses: actions/download-artifact@v4
+        with:
+          name: stela-preview-efi
+          path: efi
+      - name: Build macOS universal installer with embedded EFI
+        shell: bash
+        run: |
+          set -euo pipefail
+          export STELA_EFI="$PWD/efi/stela.efi"
+          cargo build --release --locked -p stela-cli --target aarch64-apple-darwin
+          cargo build --release --locked -p stela-cli --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/stela target/aarch64-apple-darwin/release/stela target/x86_64-apple-darwin/release/stela
+          codesign --force --sign - dist/stela
+          lipo -info dist/stela
+          python3 -c 'import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_bytes() in pathlib.Path(sys.argv[2]).read_bytes(), "EFI not embedded"' efi/stela.efi dist/stela
+          ./dist/stela --version
+          git rev-parse HEAD > dist/SOURCE_COMMIT.txt
+          printf 'Experimental Stela build from main at %s\nUse: sudo ./stela update\nWARNING: Updates the Stela USB stick. Keep a backup.\n' "$(git rev-parse --short=12 HEAD)" > dist/INSTALL.txt
+          (cd dist && shasum -a 256 stela > SHA256SUMS)
+          tar -C dist -czf stela-preview-3936c2b4-macos-universal.tar.gz stela SOURCE_COMMIT.txt INSTALL.txt SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-preview-3936c2b4-macos-universal
+          path: stela-preview-3936c2b4-macos-universal.tar.gz
+          if-no-files-found: error
+          retention-days: 14
