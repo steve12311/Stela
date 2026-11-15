@@ -187,22 +187,28 @@ impl Link for RootLink {
 }
 
 /// The PC's clock, moving the screen's running step as the stack waits.
+/// Use the same BSP-relative TSC as the engine. On AMD, an AP's raw TSC may
+/// differ by seconds; the Host applies the AP's software offset after SMP
+/// synchronization. Raw driver Clock::ticks() intentionally does not.
 struct Ticking(Clock);
+
+impl Ticking {
+    fn synchronized_now_us(&self) -> Result<u64, stela_runtime::net::ClockError> {
+        self.0
+            .try_now_us_with(super::host::rdtsc)
+            .map_err(stela_runtime::net::ClockError::Calibration)
+    }
+}
 
 impl stela_runtime::net::Clock for Ticking {
     fn now_us(&self) -> Result<u64, stela_runtime::net::ClockError> {
         crate::status::tick();
-        self.0
-            .try_now_us()
-            .map_err(stela_runtime::net::ClockError::Calibration)
+        self.synchronized_now_us()
     }
     /// The adapter's completion signal wakes the boot processor, which runs
-    /// the stack.
+    /// the stack. Its deadline uses the same clock source as now_us().
     fn sleep(&self, until_us: u64) -> Result<(), stela_runtime::net::ClockError> {
-        let now = self
-            .0
-            .try_now_us()
-            .map_err(stela_runtime::net::ClockError::Calibration)?;
+        let now = self.synchronized_now_us()?;
         if until_us > now {
             super::host::sleep_for(until_us - now);
         }
