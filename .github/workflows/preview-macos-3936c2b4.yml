@@ -1,12 +1,12 @@
 # Preview build of upstream Stela at 3936c2b4, isolated from main.
 # Mirrors the upstream release app -> efi -> macOS CLI artifact chain,
 # without creating or publishing a release or changing the default branch.
-name: Preview macOS installer (3936c2b4)
+name: AMD Network TSC Fix - macOS Preview
 
 on:
   push:
     branches:
-      - build/stela-main-3936c2b4
+      - fix/amd-network-tsc-clock
   workflow_dispatch:
 
 permissions:
@@ -60,6 +60,11 @@ jobs:
         run: |
           rustup toolchain install
           rustc --version
+      - name: Verify format and AMD clock regression tests
+        shell: bash
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked -p stela-driver-base synchronized_tsc_source_keeps_network_time_monotonic_across_amd_cores
       - name: Build cache keys
         id: keys
         shell: bash
@@ -148,12 +153,12 @@ jobs:
           python3 -c 'import pathlib,sys; assert pathlib.Path(sys.argv[1]).read_bytes() in pathlib.Path(sys.argv[2]).read_bytes(), "EFI not embedded"' efi/stela.efi dist/stela
           ./dist/stela --version
           git rev-parse HEAD > dist/SOURCE_COMMIT.txt
-          printf 'Experimental Stela build from main at %s\nUse: sudo ./stela update\nWARNING: Updates the Stela USB stick. Keep a backup.\n' "$(git rev-parse --short=12 HEAD)" > dist/INSTALL.txt
+          printf 'Experimental Stela AMD network TSC fix build at %s\nUse: sudo ./stela update\nWARNING: Updates the Stela USB stick. Keep a backup.\n' "$(git rev-parse --short=12 HEAD)" > dist/INSTALL.txt
           (cd dist && shasum -a 256 stela > SHA256SUMS)
-          tar -C dist -czf stela-preview-3936c2b4-macos-universal.tar.gz stela SOURCE_COMMIT.txt INSTALL.txt SHA256SUMS
+          tar -C dist -czf stela-amd-network-tsc-fix-macos-universal.tar.gz stela SOURCE_COMMIT.txt INSTALL.txt SHA256SUMS
       - uses: actions/upload-artifact@v4
         with:
-          name: stela-preview-3936c2b4-macos-universal
-          path: stela-preview-3936c2b4-macos-universal.tar.gz
+          name: stela-amd-network-tsc-fix-macos-universal
+          path: stela-amd-network-tsc-fix-macos-universal.tar.gz
           if-no-files-found: error
           retention-days: 14
