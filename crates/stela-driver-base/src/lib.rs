@@ -223,11 +223,19 @@ impl Clock {
         self.elapsed_at(start, Self::ticks())
     }
 
+    /// Microseconds from a caller-owned synchronized TSC source. This keeps
+    /// the counter's origin and calibration; only the reading is supplied by
+    /// the owner (for example, the Host's AP software-offset TSC).
+    /// Validate calibration before observing the source.
+    pub fn try_now_us_with(&self, counter: impl FnOnce() -> u64) -> Result<u64, ClockError> {
+        self.check_duration(0)?;
+        Ok(counter() / self.ticks_per_microsecond)
+    }
+
     /// Microseconds since the raw counter's arbitrary origin. This quotient
     /// rolls over when the raw TSC does; use Deadline for wrap-safe intervals.
     pub fn try_now_us(&self) -> Result<u64, ClockError> {
-        self.check_duration(0)?;
-        Ok(Self::ticks() / self.ticks_per_microsecond)
+        self.try_now_us_with(Self::ticks)
     }
 
     /// Infallible compatibility entry for a previously validated clock.
@@ -407,6 +415,39 @@ mod tests {
         assert!(Arc::ptr_eq(cloned.firmware.as_ref().unwrap(), &catalog));
         drop(handoff);
         assert_eq!(cloned.firmware.as_ref().unwrap().inventory(), (0, 0));
+    }
+
+    #[test]
+    fn synchronized_tsc_source_keeps_network_time_monotonic_across_amd_cores() {
+        let clock = Clock {
+            ticks_per_microsecond: 3_194,
+        };
+        // Observed on the Ryzen 7 5800H: an AP's raw TSC was ~2.65 s
+        // ahead of the BSP, with a compensating software offset.
+        let ap_offset = -8_475_508_202_i64;
+        let bsp_before = 40_000_000_000_u64;
+        let ap_raw = bsp_before + 8_475_508_202 + 3_194_000;
+        let bsp_after = bsp_before + 6_388_000;
+        let corrected = [bsp_before, ap_raw.wrapping_add_signed(ap_offset), bsp_after];
+        let microseconds = corrected.map(|tsc| clock.try_now_us_with(|| tsc).unwrap());
+        assert!(microseconds.windows(2).all(|pair| pair[1] >= pair[0]));
+
+        // Reading the AP's uncorrected value makes the next BSP sample
+        // appear to regress, even though all three samples are ordered.
+        assert!(clock.try_now_us_with(|| ap_raw).unwrap() > microseconds[2]);
+
+        let invalid = Clock {
+            ticks_per_microsecond: 0,
+        };
+        let mut called = false;
+        assert_eq!(
+            invalid.try_now_us_with(|| {
+                called = true;
+                0
+            }),
+            Err(ClockError::Uncalibrated)
+        );
+        assert!(!called);
     }
 
     #[test]
